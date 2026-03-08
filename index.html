@@ -889,6 +889,8 @@ const DAYS   = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Sat
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
 let tasks = [], lastIdx = -1, lastFlash = -1;
+let weekSchedule = null;
+let lastRenderedDay = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
 
 /* ══════════════════════════════════════════
    CLOCK
@@ -977,19 +979,45 @@ function parseCSV(text, fname) {
 }
 
 function parseXLSX(buf, fname) {
-  const wb   = XLSX.read(buf, {type:'array'});
-  const ws   = wb.Sheets[wb.SheetNames[0]];
-  const data = XLSX.utils.sheet_to_json(ws, {raw:false, defval:''});
-  if (!data.length) { alert('Empty file.'); return; }
-  const keys = Object.keys(data[0]);
-  const kT = fck(keys,['title','task','name']);
-  const kS = fck(keys,['start','start time','starttime','begin']);
-  const kE = fck(keys,['end','end time','endtime','finish','stop']);
-  const kN = fck(keys,['notes','note','description','desc']);
-  if (!kT||!kS||!kE) { alert('Missing columns. Need: Title, Start Time, End Time'); return; }
-  loadTasks(data.filter(r => r[kT]).map(r => ({
-    title: r[kT], startRaw: r[kS], endRaw: r[kE], notes: kN ? r[kN] : ''
-  })), fname);
+  const wb = XLSX.read(buf, {type:'array'});
+  const DAY_NAMES = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+  const sheetNamesLower = wb.SheetNames.map(s => s.toLowerCase().trim());
+  const isWeekly = DAY_NAMES.some(d => sheetNamesLower.includes(d));
+
+  if (isWeekly) {
+    const weekMap = {};
+    wb.SheetNames.forEach(sn => {
+      const key = sn.toLowerCase().trim();
+      const di  = DAY_NAMES.indexOf(key);
+      if (di === -1) return;
+      const ws   = wb.Sheets[sn];
+      const data = XLSX.utils.sheet_to_json(ws, {raw:false, defval:''});
+      if (!data.length) return;
+      const keys = Object.keys(data[0]);
+      const kT = fck(keys,['title','task','name']);
+      const kS = fck(keys,['start','start time','starttime','begin']);
+      const kE = fck(keys,['end','end time','endtime','finish','stop']);
+      const kN = fck(keys,['notes','note','description','desc']);
+      if (!kT||!kS||!kE) return;
+      weekMap[di] = data.filter(r => r[kT]).map(r => ({
+        title: r[kT], startRaw: r[kS], endRaw: r[kE], notes: kN ? r[kN] : ''
+      }));
+    });
+    loadWeekly(weekMap, fname);
+  } else {
+    const ws   = wb.Sheets[wb.SheetNames[0]];
+    const data = XLSX.utils.sheet_to_json(ws, {raw:false, defval:''});
+    if (!data.length) { alert('Empty file.'); return; }
+    const keys = Object.keys(data[0]);
+    const kT = fck(keys,['title','task','name']);
+    const kS = fck(keys,['start','start time','starttime','begin']);
+    const kE = fck(keys,['end','end time','endtime','finish','stop']);
+    const kN = fck(keys,['notes','note','description','desc']);
+    if (!kT||!kS||!kE) { alert('Missing columns. Need: Title, Start Time, End Time'); return; }
+    loadTasks(data.filter(r => r[kT]).map(r => ({
+      title: r[kT], startRaw: r[kS], endRaw: r[kE], notes: kN ? r[kN] : ''
+    })), fname);
+  }
 }
 
 const fc  = (arr,cs) => { for(const c of cs){const i=arr.findIndex(h=>h.includes(c));if(i>=0)return i;}return -1; };
@@ -1035,19 +1063,83 @@ function nowMin() {
 /* ══════════════════════════════════════════
    LOAD & VALIDATE
 ══════════════════════════════════════════ */
-function loadTasks(rows, fname) {
+
+// weekSchedule and lastRenderedDay declared at top-level above
+
+// Get JS day (0=Sun) → our day index (0=Mon)
+function todayDayIdx() {
+  const jsDay = new Date().getDay(); // 0=Sun,1=Mon,...,6=Sat
+  return jsDay === 0 ? 6 : jsDay - 1; // convert to Mon=0…Sun=6
+}
+
+function loadWeekly(weekMap, fname) {
+  weekSchedule = weekMap;
+  const sn = $('sched-name');
+  sn.textContent = fname.replace(/\.[^.]+$/, '') + ' · Weekly';
+  sn.style.display = 'block';
+
+  // validate all days, collect errors
+  const allErrs = [];
+  const DAY_LABELS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+  Object.entries(weekMap).forEach(([di, rows]) => {
+    const {errs} = validateRows(rows, DAY_LABELS[di]);
+    allErrs.push(...errs);
+  });
+  if (allErrs.length) {
+    $('wlist').innerHTML = allErrs.map(e=>`<li>${e}</li>`).join('');
+    $('wpanel').style.display = 'block';
+  } else {
+    $('wpanel').style.display = 'none';
+  }
+
+  // Load today's tasks
+  activateTodayTasks();
+}
+
+function activateTodayTasks() {
+  if (!weekSchedule) return;
+  const di = todayDayIdx();
+  const rows = weekSchedule[di] || [];
+  const DAY_LABELS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+
+  if (!rows.length) {
+    tasks = []; lastIdx = -1; lastFlash = -1;
+    buildStrip();
+    showInfo('🏖️', `No tasks for ${DAY_LABELS[di]}`, 'Enjoy your day off!');
+    return;
+  }
+
+  const {parsed} = validateRows(rows, DAY_LABELS[di]);
+  if (!parsed.length) {
+    showInfo('⚠️', `No valid tasks for ${DAY_LABELS[di]}`, 'Check the warnings panel.');
+    return;
+  }
+
+  tasks = parsed; lastIdx = -1; lastFlash = -1;
+  buildStrip();
+  render();
+}
+
+// Returns {parsed, errs} for a single day's rows
+function validateRows(rows, dayLabel) {
   const errs = [], parsed = [];
   rows.forEach((r, i) => {
     const s = parseTime(r.startRaw), e = parseTime(r.endRaw);
-    if (s===null) { errs.push(`Row ${i+2}: Bad start time "${r.startRaw}" — ${r.title}`); return; }
-    if (e===null) { errs.push(`Row ${i+2}: Bad end time "${r.endRaw}" — ${r.title}`);   return; }
-    if (e<=s)     { errs.push(`Row ${i+2}: End ≤ Start — ${r.title}`);                   return; }
+    if (s===null) { errs.push(`${dayLabel} row ${i+2}: Bad start time "${r.startRaw}" — ${r.title}`); return; }
+    if (e===null) { errs.push(`${dayLabel} row ${i+2}: Bad end time "${r.endRaw}" — ${r.title}`);   return; }
+    if (e<=s)     { errs.push(`${dayLabel} row ${i+2}: End ≤ Start — ${r.title}`);                   return; }
     parsed.push({ title:r.title, startMin:s, endMin:e, notes:r.notes||'' });
   });
   parsed.sort((a,b) => a.startMin - b.startMin);
   for (let i=1; i<parsed.length; i++)
     if (parsed[i].startMin < parsed[i-1].endMin)
-      errs.push(`Overlap: "${parsed[i-1].title}" ends ${fmt(parsed[i-1].endMin)} but "${parsed[i].title}" starts ${fmt(parsed[i].startMin)}`);
+      errs.push(`${dayLabel}: Overlap — "${parsed[i-1].title}" ends ${fmt(parsed[i-1].endMin)} but "${parsed[i].title}" starts ${fmt(parsed[i].startMin)}`);
+  return {parsed, errs};
+}
+
+function loadTasks(rows, fname) {
+  weekSchedule = null; // single-day mode
+  const {errs, parsed} = validateRows(rows, 'Schedule');
 
   if (errs.length) {
     $('wlist').innerHTML = errs.map(e=>`<li>${e}</li>`).join('');
@@ -1102,6 +1194,16 @@ function updateStrip(idx) {
    MAIN RENDER LOOP
 ══════════════════════════════════════════ */
 function render() {
+  // Weekly mode: reload tasks if day has changed (midnight rollover)
+  if (weekSchedule) {
+    const currentDay = todayDayIdx();
+    if (currentDay !== lastRenderedDay) {
+      lastRenderedDay = currentDay;
+      activateTodayTasks();
+      return; // activateTodayTasks calls render() via buildStrip+render
+    }
+  }
+
   if (!tasks.length) return;
 
   const now        = nowMin();
@@ -1139,7 +1241,24 @@ function render() {
   vis('actview',   false);
   vis('infostate', false);
 
-  if (allDone)    { showInfo('🎉','All tasks complete!','Great work today.'); return; }
+  if (allDone) {
+    // If weekly, show tomorrow's first task
+    if (weekSchedule) {
+      const DAY_LABELS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+      const nextDi = (todayDayIdx() + 1) % 7;
+      const nextRows = weekSchedule[nextDi] || [];
+      const {parsed: nextParsed} = nextRows.length ? validateRows(nextRows, '') : {parsed:[]};
+      if (nextParsed.length) {
+        showInfo('🎉', "Today's schedule complete!",
+          `Tomorrow (${DAY_LABELS[nextDi]}): starts with "${nextParsed[0].title}" at ${fmt(nextParsed[0].startMin)}`);
+      } else {
+        showInfo('🎉', "Today's schedule complete!", `Tomorrow: ${DAY_LABELS[nextDi]} — no tasks scheduled`);
+      }
+    } else {
+      showInfo('🎉','All tasks complete!','Great work today.');
+    }
+    return;
+  }
   if (notStarted) { showInfo('⏳',`Starts at ${fmt(tasks[0].startMin)}`,`First: ${tasks[0].title}`); updateStrip(-1); return; }
   if (idx < 0)    {
     const nxt = tasks.find(t => t.startMin > now);
